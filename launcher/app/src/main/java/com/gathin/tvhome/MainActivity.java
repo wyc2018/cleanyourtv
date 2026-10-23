@@ -46,7 +46,9 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.UserManager;
 import android.provider.Settings;
+import android.util.Log;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextPaint;
@@ -275,6 +277,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     private boolean appLibrarySelection;
     private boolean libraryFocusPending;
     private RecyclerView.OnScrollListener pendingFocusScroll;
+    /**
+     * This instance was created before the user unlocked. Credential storage is closed then, so the
+     * real home is filled in on this same window after ACTION_USER_UNLOCKED. Recreate would destroy
+     * the window, and this firmware then shows the TV input underneath until the new one draws.
+     * The window has to be up before unlock: Home is resolved once, and a miss there is a black screen.
+     */
+    private boolean waitingForUnlock;
+    private BroadcastReceiver unlockReceiver;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     /** Refreshes the network pill when the connection changes: at boot Wi-Fi often connects after Home is shown. */
@@ -348,9 +358,142 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         }
     };
 
+    /**
+     * Home is resolved once, while the user is still locked. The activity is directBootAware so that
+     * resolve succeeds; prefs and the theme live in credential storage, so they are read after unlock.
+     * Returns true when this instance should stop here and wait.
+     */
+    private boolean waitForUserUnlock() {
+        UserManager users = (UserManager) getSystemService(USER_SERVICE);
+        if (users == null || users.isUserUnlocked()) return false;
+        waitingForUnlock = true;
+        setContentView(R.layout.activity_main);
+        unlockReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                UserManager now = (UserManager) getSystemService(USER_SERVICE);
+                if (now != null && !now.isUserUnlocked()) return;
+                try {
+                    unregisterReceiver(this);
+                } catch (IllegalArgumentException ignored) {
+                }
+                unlockReceiver = null;
+                continueAfterUnlock();
+            }
+        };
+        registerReceiver(unlockReceiver, new IntentFilter(Intent.ACTION_USER_UNLOCKED));
+        if (users.isUserUnlocked()) {
+            try {
+                unregisterReceiver(unlockReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            unlockReceiver = null;
+            waitingForUnlock = false;
+            return false;
+        }
+        return true;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (waitForUserUnlock()) {
+            // The placeholder window is already up. The video is still playing; dismiss its
+            // trailing JuHaoKan shadow once that video is nearly finished.
+            watchBootVideoThenShowDesktop();
+            return;
+        }
+        buildHome(savedInstanceState);
+        watchBootVideoThenShowDesktop();
+    }
+
+    private boolean bootShadowWatchStarted;
+
+    /**
+     * After the boot video, BootAd always paints the JuHaoKan poster (ShadowAnimation) unless
+     * sys.first_window.displayed is already "1" on a tick before the last frame. Setting it then
+     * hides the boot layer and the poster never comes up. The poster file itself is replaced
+     * separately, so a late set still does not show 聚好看.
+     */
+    private void watchBootVideoThenShowDesktop() {
+        if (bootShadowWatchStarted) return;
+        bootShadowWatchStarted = true;
+        if ("1".equals(systemProperty("sys.boot_completed", "0"))
+                && !"running".equals(systemProperty("init.svc.bootanim", ""))) {
+            return;
+        }
+        final long[] videoSeenAt = {-1L};
+        handler.post(new Runnable() {
+            int ticks;
+            String lastPlaying = "";
+
+            @Override
+            public void run() {
+                if (isFinishing()) return;
+                ticks++;
+                String playing = systemProperty("sys.bootvideo.playing", "0");
+                if (!playing.equals(lastPlaying)) {
+                    Log.i("tvhome", "sys.bootvideo.playing=" + playing);
+                    lastPlaying = playing;
+                }
+                if (videoSeenAt[0] < 0 && !playing.isEmpty() && !"0".equals(playing)) {
+                    videoSeenAt[0] = SystemClock.uptimeMillis();
+                }
+                long advert = 10080L;
+                try {
+                    advert = Long.parseLong(systemProperty("persist.sys.video_advert_time", "10080"));
+                } catch (NumberFormatException ignored) {
+                }
+                long hold = Math.max(0L, advert - 700L);
+                boolean videoLongEnough = videoSeenAt[0] >= 0
+                        && SystemClock.uptimeMillis() - videoSeenAt[0] >= hold;
+                // playing stays 0 for the whole video on some boots; don't wait past the shadow.
+                boolean gaveUp = ticks > 80;
+                if (videoLongEnough || gaveUp) {
+                    setSystemProperty("sys.first_window.displayed", "1");
+                    Log.i("tvhome", "dismiss boot shadow early=" + videoLongEnough
+                            + " displayed=" + systemProperty("sys.first_window.displayed", ""));
+                    return;
+                }
+                handler.postDelayed(this, 200);
+            }
+        });
+    }
+
+    private static String systemProperty(String key, String def) {
+        try {
+            Class<?> c = Class.forName("android.os.SystemProperties");
+            Object v = c.getMethod("get", String.class, String.class).invoke(null, key, def);
+            return v instanceof String ? (String) v : def;
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private static void setSystemProperty(String key, String value) {
+        try {
+            Class<?> c = Class.forName("android.os.SystemProperties");
+            c.getMethod("set", String.class, String.class).invoke(null, key, value);
+            return;
+        } catch (Exception ignored) {
+        }
+        try {
+            Process p = new ProcessBuilder("setprop", key, value).redirectErrorStream(true).start();
+            p.waitFor();
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Unlock arrived on the window that was already showing. Fill in Home without destroying it. */
+    private void continueAfterUnlock() {
+        waitingForUnlock = false;
+        buildHome(null);
+        // onStart and onResume already ran while locked and returned before any of this existed.
+        onStartWork();
+        onResumeWork();
+    }
+
+    private void buildHome(Bundle savedInstanceState) {
         setContentView(R.layout.activity_main);
         density = getResources().getDisplayMetrics().density;
         // config.xml, overlaid by config.json from a pushed theme (see Config and tools/theme.sh).
@@ -779,6 +922,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        if (waitingForUnlock) return;
         if (openLauncherSettingsIfAsked(intent)) return;
         if (openInputsIfAsked(intent)) return;
         if (intent == null || !intent.hasCategory(Intent.CATEGORY_HOME)) return;
@@ -797,6 +941,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStart() {
         super.onStart();
+        if (waitingForUnlock) return;
+        onStartWork();
+    }
+
+    private void onStartWork() {
         stopped = false;
         started = true;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -811,6 +960,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onResume() {
         super.onResume();
+        if (waitingForUnlock) return;
+        onResumeWork();
+    }
+
+    private void onResumeWork() {
         // A festival that started or ended while Home was in the background: rebuild with or without it.
         if (festive != festival.active(LocalDate.now())) {
             recreate();
@@ -1011,6 +1165,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onUserInteraction() {
         super.onUserInteraction();
+        if (waitingForUnlock) return;
         restartIdleClock();
     }
 
@@ -1022,6 +1177,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onPause() {
         super.onPause();
+        if (waitingForUnlock) return;
         root.removeCallbacks(showIdleClock);
         endReorder();   // Home or another app while reordering keeps the order so far
         wallpaperPlayer.stop();
@@ -1042,6 +1198,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onStop() {
         super.onStop();
+        if (waitingForUnlock) return;
         started = false;
         unregisterReceiver(timeReceiver);
         handler.removeCallbacks(clockCheck);
@@ -1057,6 +1214,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
+        if (waitingForUnlock) return;
         // RUNNING_LOW and CRITICAL also arrive while Home is visible when an accessibility service keeps the
         // process in the foreground; never blank the screen the owner is looking at.
         boolean due = level >= TRIM_MEMORY_BACKGROUND
@@ -1075,6 +1233,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (waitingForUnlock) return;
         if (hasFocus) {
             startPendingSettingsReorder();
             if (libraryFocusPending && appLibrary == null) focusLibrary();
@@ -1085,6 +1244,14 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (unlockReceiver != null) {
+            try {
+                unregisterReceiver(unlockReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            unlockReceiver = null;
+        }
+        if (waitingForUnlock) return;
         unregisterReceiver(packageReceiver);
         wallpaperPlayer.close();
         ConnectivityManager cm = getSystemService(ConnectivityManager.class);
